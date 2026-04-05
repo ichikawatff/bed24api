@@ -52,7 +52,7 @@ export function RevenueChart({ data }: { data: RevenueData }) {
         />
         <Tooltip
           cursor={{ fill: "#f3f4f6" }}
-          formatter={(value: number) => [`¥${value.toLocaleString()}`, "売上"]}
+          formatter={(value) => [`¥${Number(value).toLocaleString()}`, "売上"]}
           labelStyle={{ color: "#374151", fontWeight: "bold" }}
           contentStyle={{ borderRadius: "8px", border: "1px solid #e5e7eb" }}
         />

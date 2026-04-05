@@ -1,65 +1,92 @@
-import { supabase } from "@/lib/supabase/client";
 import { RevenueChart } from "@/components/dashboard/RevenueChart";
 import { RecentBookings } from "@/components/dashboard/RecentBookings";
 import { YearlyRevenueTable } from "@/components/dashboard/YearlyRevenueTable";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { getServerSupabase } from "@/lib/supabase/server";
+import type { Database } from "@/lib/supabase/types";
 import { TrendingUp, Users, CalendarSync } from "lucide-react";
+
+type DailyRevenueRow = Pick<
+  Database["public"]["Tables"]["daily_revenues"]["Row"],
+  "target_date" | "daily_amount"
+>;
+
+type BookingRow = Database["public"]["Tables"]["bookings"]["Row"];
+
+type YearlyRevenueData = {
+  year: string;
+  data: { month: string; amount: number }[];
+};
 
 export const revalidate = 0;
 
-export default async function DashboardPage() {
-  // 1. 売上データの取得と「年別・12ヶ月ごと」の集計
-  const { data: revData, error: revError } = await supabase
-    .from("daily_revenues")
-    .select("target_date, daily_amount");
-    
-  let yearlyDataRecord: Record<string, number[]> = {};
-  let currentMonthRevenue = 0;
-  const now = new Date();
-  const currentYear = now.getFullYear().toString();
-  const currentMonthIndex = now.getMonth(); // 0-11
+function buildYearlyRevenueData(revenueRows: DailyRevenueRow[]): YearlyRevenueData[] {
+  const yearlyDataRecord: Record<string, number[]> = {};
 
-  if (revData && !revError && revData.length > 0) {
-    // データを年ごとに分け、1〜12月の配列(長さ12)に集計する
-    revData.forEach((row: any) => {
-      const year = row.target_date.substring(0, 4); // "2024", "2025" 等
-      const monthIndex = parseInt(row.target_date.substring(5, 7), 10) - 1; // 0〜11
-      
-      if (!yearlyDataRecord[year]) {
-        // まだその年の配列がなければ、0で埋めた12ヶ月分の配列を作る
-        yearlyDataRecord[year] = Array(12).fill(0);
-      }
-      yearlyDataRecord[year][monthIndex] += Number(row.daily_amount);
-    });
+  revenueRows.forEach((row) => {
+    const year = row.target_date.slice(0, 4);
+    const monthIndex = Number(row.target_date.slice(5, 7)) - 1;
 
-    // 当月の売上見込を取得
-    if (yearlyDataRecord[currentYear]) {
-      currentMonthRevenue = Math.round(yearlyDataRecord[currentYear][currentMonthIndex]);
+    if (!Number.isInteger(monthIndex) || monthIndex < 0 || monthIndex > 11) {
+      return;
     }
-  }
 
-  // 存在する年を降順（新しい年が上）にソートして、コンポーネントに渡す形に成形
-  // 2026, 2025, 2024 ... となる
-  const years = Object.keys(yearlyDataRecord).sort((a, b) => Number(b) - Number(a));
-  
-  const formattedYearlyData = years.map((year) => {
-    return {
-      year,
-      data: yearlyDataRecord[year].map((amount, i) => ({
-        month: `${i + 1}月`, // 横軸のラベルになる部分
-        amount: Math.round(amount),
-      }))
-    };
+    if (!yearlyDataRecord[year]) {
+      yearlyDataRecord[year] = Array(12).fill(0);
+    }
+
+    yearlyDataRecord[year][monthIndex] += Number(row.daily_amount ?? 0);
   });
 
-  // 2. 直近の予約・チェックイン情報取得
-  const { data: bookingsData } = await supabase
-    .from("bookings")
-    .select("*")
-    .order("checkin_date", { ascending: false })
-    .limit(10); // 直近10件のみ
+  return Object.keys(yearlyDataRecord)
+    .sort((left, right) => Number(right) - Number(left))
+    .map((year) => ({
+      year,
+      data: yearlyDataRecord[year].map((amount, index) => ({
+        month: `${index + 1}月`,
+        amount: Math.round(amount),
+      })),
+    }));
+}
 
-  const bookings = bookingsData || [];
+function getCurrentMonthRevenue(
+  yearlyRevenueData: YearlyRevenueData[],
+  now: Date,
+): number {
+  const currentYear = now.getFullYear().toString();
+  const currentMonthIndex = now.getMonth();
+  const currentYearData = yearlyRevenueData.find(
+    (yearData) => yearData.year === currentYear,
+  );
+
+  return currentYearData?.data[currentMonthIndex]?.amount ?? 0;
+}
+
+export default async function DashboardPage() {
+  const supabase = getServerSupabase();
+  const [revenueResult, bookingsResult, bookingCountResult] = await Promise.all([
+    supabase.from("daily_revenues").select("target_date, daily_amount"),
+    supabase
+      .from("bookings")
+      .select("*")
+      .order("checkin_date", { ascending: false })
+      .limit(10),
+    supabase.from("bookings").select("*", { count: "exact", head: true }),
+  ]);
+
+  const formattedYearlyData = buildYearlyRevenueData(revenueResult.data ?? []);
+  const bookings: BookingRow[] = bookingsResult.data ?? [];
+  const totalBookings = bookingCountResult.count ?? 0;
+  const currentMonthRevenue = getCurrentMonthRevenue(
+    formattedYearlyData,
+    new Date(),
+  );
 
   return (
     <div className="min-h-screen bg-slate-50/50 p-4 md:p-8 pt-12 pb-24 text-slate-900 font-sans">
@@ -99,10 +126,10 @@ export default async function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="text-3xl font-black text-slate-800">
-                {bookings.length} <span className="text-xl font-bold text-slate-600">件</span>
+                {totalBookings} <span className="text-xl font-bold text-slate-600">件</span>
               </div>
               <p className="text-xs text-slate-400 mt-1 font-medium">
-                表示対象の直近予約データ
+                Supabase に保存済みの予約総数
               </p>
             </CardContent>
           </Card>

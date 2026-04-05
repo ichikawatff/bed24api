@@ -1,48 +1,100 @@
-import { getServiceSupabase } from "@/lib/supabase/client";
-import { eachDayOfInterval, format, parseISO } from "date-fns";
-import { toZonedTime } from "date-fns-tz";
+import type { Beds24Booking } from "@/lib/beds24";
+import { getServiceSupabase } from "@/lib/supabase/server";
+import type { Database } from "@/lib/supabase/types";
 
-export async function syncBookingAndRevenue(bookingData: any) {
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const CANCELLED_STATUSES = new Set(["0", "cancelled", "canceled"]);
+
+function parseCalendarDate(value: string, label: string): Date {
+  const parts = value.split("-").map((part) => Number(part));
+
+  if (parts.length !== 3 || parts.some((part) => Number.isNaN(part))) {
+    throw new Error(`${label} must be a valid YYYY-MM-DD date.`);
+  }
+
+  const [year, month, day] = parts;
+  const parsedDate = new Date(Date.UTC(year, month - 1, day));
+
+  if (parsedDate.toISOString().slice(0, 10) !== value) {
+    throw new Error(`${label} must be a valid YYYY-MM-DD date.`);
+  }
+
+  return parsedDate;
+}
+
+function formatCalendarDate(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function getStayDates(checkinDate: string, checkoutDate: string): string[] {
+  const arrivalDate = parseCalendarDate(checkinDate, "checkinDate");
+  const departureDate = parseCalendarDate(checkoutDate, "checkoutDate");
+  const diffMs = departureDate.getTime() - arrivalDate.getTime();
+  const nights = diffMs > 0 ? Math.round(diffMs / ONE_DAY_MS) : 1;
+
+  return Array.from({ length: nights }, (_, index) =>
+    formatCalendarDate(new Date(arrivalDate.getTime() + index * ONE_DAY_MS)),
+  );
+}
+
+function allocateDailyAmounts(totalAmount: number, nights: number): number[] {
+  if (nights <= 0) {
+    return [];
+  }
+
+  const totalCents = Math.round(totalAmount * 100);
+  const sign = totalCents < 0 ? -1 : 1;
+  const absoluteCents = Math.abs(totalCents);
+  const baseCents = Math.floor(absoluteCents / nights);
+  const remainder = absoluteCents % nights;
+
+  return Array.from({ length: nights }, (_, index) => {
+    const cents = baseCents + (index < remainder ? 1 : 0);
+    return (cents * sign) / 100;
+  });
+}
+
+export async function syncBookingAndRevenue(bookingData: Beds24Booking) {
+  if (!bookingData.arrival || !bookingData.departure) {
+    throw new Error("Beds24 booking is missing arrival or departure date.");
+  }
+
   const supabase = getServiceSupabase();
-  const beds24BookingId = bookingData.id.toString();
-
-  // Beds24のデータから必要な項目を抽出
-  // APIV2レスポンスの構造に合わせる(V2仕様に準拠)
-  const propertyId = bookingData.propertyId?.toString() || "unknown";
-  const roomId = bookingData.roomId?.toString() || "unknown";
-  const guestName = `${bookingData.firstName || ""} ${bookingData.lastName || ""}`.trim();
-  const checkinDate = bookingData.arrival; // YYYY-MM-DD format
+  const beds24BookingId = String(bookingData.id);
+  const propertyId =
+    bookingData.propertyId != null ? String(bookingData.propertyId) : "unknown";
+  const roomId =
+    bookingData.roomId != null ? String(bookingData.roomId) : "unknown";
+  const guestName =
+    `${bookingData.firstName ?? ""} ${bookingData.lastName ?? ""}`.trim() || null;
+  const checkinDate = bookingData.arrival;
   const checkoutDate = bookingData.departure;
-  const status = bookingData.status?.toString() || "0"; 
-  const totalAmount = Number(bookingData.price) || 0;
-  
-  const arrivalDate = parseISO(checkinDate);
-  const departureDate = parseISO(checkoutDate);
-  
-  // 宿泊日数の計算
-  // (チェックアウト日は宿泊日には含まれないため、departureDateから1日引くか、eachDayOfIntervalを工夫する)
-  const diffTime = Math.abs(departureDate.getTime() - arrivalDate.getTime());
-  let nights = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-  if (nights <= 0) nights = 1;
+  const rawStatus = String(bookingData.status ?? "0");
+  const normalizedStatus = rawStatus.trim().toLowerCase();
+  const parsedTotalAmount = Number(bookingData.price ?? 0);
+  const totalAmount = Number.isFinite(parsedTotalAmount) ? parsedTotalAmount : 0;
+  const stayDates = getStayDates(checkinDate, checkoutDate);
+  const nights = stayDates.length;
+  const timestamp = new Date().toISOString();
 
-  // 1. Bookings テーブルの UPSERT
+  const bookingPayload: Database["public"]["Tables"]["bookings"]["Insert"] = {
+    beds24_booking_id: beds24BookingId,
+    property_id: propertyId,
+    room_id: roomId,
+    guest_name: guestName,
+    checkin_date: checkinDate,
+    checkout_date: checkoutDate,
+    ota_name: bookingData.apiSource?.trim() || "Direct",
+    status: rawStatus,
+    total_amount: totalAmount,
+    nights,
+    updated_at: timestamp,
+  };
+
   const { data: bookingRow, error: bookingError } = await supabase
     .from("bookings")
-    .upsert({
-      beds24_booking_id: beds24BookingId,
-      property_id: propertyId,
-      room_id: roomId,
-      guest_name: guestName,
-      checkin_date: checkinDate,
-      checkout_date: checkoutDate,
-      ota_name: bookingData.apiSource || "Direct",
-      status: status,
-      total_amount: totalAmount,
-      nights: nights,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'beds24_booking_id' })
-    .select()
+    .upsert(bookingPayload, { onConflict: "beds24_booking_id" })
+    .select("id")
     .single();
 
   if (bookingError || !bookingRow) {
@@ -50,43 +102,29 @@ export async function syncBookingAndRevenue(bookingData: any) {
     throw new Error("Failed to sync booking data.");
   }
 
-  const generatedBookingId = bookingRow.id;
-
-  // 2. Daily Revenues テーブルの再構築
-  // 過去の該当予約の日割りデータを一度削除（キャンセルや変更にも対応するため）
-  await supabase
+  const { error: deleteError } = await supabase
     .from("daily_revenues")
     .delete()
     .eq("beds24_booking_id", beds24BookingId);
 
-  // ステータスがキャンセル('0' または キャンセルを意味する値)の場合は日割りを登録しない
-  if (status === "0" || status === "cancelled") {
+  if (deleteError) {
+    console.error("Supabase Daily Revenue Delete Error:", deleteError);
+    throw new Error("Failed to clear previous daily revenues.");
+  }
+
+  if (CANCELLED_STATUSES.has(normalizedStatus)) {
     return { success: true, message: "Booking cancelled, revenue removed." };
   }
 
-  // 宿泊日の配列を生成 (チェックイン日 〜 チェックアウト前日)
-  const departureMinusOne = new Date(departureDate);
-  departureMinusOne.setDate(departureMinusOne.getDate() - 1);
-  
-  // 予約が日帰りの場合などのフォールバック
-  const intervalEnd = departureMinusOne < arrivalDate ? arrivalDate : departureMinusOne;
-
-  const days = eachDayOfInterval({
-    start: arrivalDate,
-    end: intervalEnd,
-  });
-
-  const dailyAmount = Number((totalAmount / nights).toFixed(2));
-
-  // バルクインサート用の配列を作成
-  const revenueRows = days.map((day) => {
-    return {
-      booking_id: generatedBookingId,
+  const dailyAmounts = allocateDailyAmounts(totalAmount, nights);
+  const revenueRows: Database["public"]["Tables"]["daily_revenues"]["Insert"][] =
+    stayDates.map((targetDate, index) => ({
+      booking_id: bookingRow.id,
       beds24_booking_id: beds24BookingId,
-      target_date: format(day, "yyyy-MM-dd"), // JSTなど考慮したフォーマット
-      daily_amount: dailyAmount,
-    };
-  });
+      target_date: targetDate,
+      daily_amount: dailyAmounts[index] ?? 0,
+      updated_at: timestamp,
+    }));
 
   if (revenueRows.length > 0) {
     const { error: revenueError } = await supabase
@@ -99,5 +137,5 @@ export async function syncBookingAndRevenue(bookingData: any) {
     }
   }
 
-  return { success: true, bookingId: generatedBookingId };
+  return { success: true, bookingId: bookingRow.id };
 }

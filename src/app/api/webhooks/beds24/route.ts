@@ -1,64 +1,175 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+
 import { getBookingFromBeds24 } from "@/lib/beds24";
+import { getErrorMessage } from "@/lib/errors";
+import { hasValidSecret } from "@/lib/security";
 import { syncBookingAndRevenue } from "@/lib/utils/revenue";
 
-// Beds24からPOSTで送られてくるWebhookを処理するエンドポイント
-export async function POST(request: Request) {
-  try {
-    // Webhookのペイロード（Beds24側のAuto Actionの設定で送信フォーマットを決める）
-    // 例えば { "bookingId": "[BOOKID]" } のようなJSONが送られてくると想定する
-    let payload;
-    try {
-      payload = await request.json();
-    } catch {
-      // JSONでパースできない場合、URLSearchParamsとしてパース（Beds24の仕様によって対応）
-      const text = await request.text();
-      const params = new URLSearchParams(text);
-      payload = { bookingId: params.get("bookingId") || params.get("id") };
-    }
+export const runtime = "nodejs";
 
-    const bookingId = payload.bookingId || payload.id;
+type Beds24WebhookPayload = {
+  bookingId?: string;
+  booking_id?: string;
+  id?: string;
+};
+
+function getStringValue(value: unknown): string | undefined {
+  if (typeof value === "number") {
+    return String(value);
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+
+  return undefined;
+}
+
+function parseJsonPayload(rawBody: string): Beds24WebhookPayload {
+  const parsedBody: unknown = JSON.parse(rawBody);
+
+  if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+    return {};
+  }
+
+  const body = parsedBody as Record<string, unknown>;
+
+  return {
+    bookingId: getStringValue(body.bookingId),
+    booking_id: getStringValue(body.booking_id),
+    id: getStringValue(body.id),
+  };
+}
+
+function parseFormPayload(rawBody: string): Beds24WebhookPayload {
+  if (!rawBody.includes("=")) {
+    return {
+      bookingId: getStringValue(rawBody),
+    };
+  }
+
+  const params = new URLSearchParams(rawBody);
+
+  return {
+    bookingId: params.get("bookingId") ?? undefined,
+    booking_id: params.get("booking_id") ?? undefined,
+    id: params.get("id") ?? undefined,
+  };
+}
+
+function parseWebhookPayload(
+  rawBody: string,
+  contentType: string | null,
+): Beds24WebhookPayload {
+  const trimmedBody = rawBody.trim();
+
+  if (!trimmedBody) {
+    return {};
+  }
+
+  if (contentType?.includes("application/json")) {
+    return parseJsonPayload(trimmedBody);
+  }
+
+  if (
+    contentType?.includes("application/x-www-form-urlencoded") ||
+    contentType?.includes("text/plain")
+  ) {
+    return parseFormPayload(trimmedBody);
+  }
+
+  try {
+    return parseJsonPayload(trimmedBody);
+  } catch {
+    return parseFormPayload(trimmedBody);
+  }
+}
+
+function extractBookingId(payload: Beds24WebhookPayload): string | null {
+  return payload.bookingId ?? payload.booking_id ?? payload.id ?? null;
+}
+
+async function syncBookingById(bookingId: string) {
+  const bookingData = await getBookingFromBeds24(bookingId);
+
+  if (!bookingData) {
+    return NextResponse.json(
+      { error: `Booking ${bookingId} not found in Beds24.` },
+      { status: 404 },
+    );
+  }
+
+  await syncBookingAndRevenue(bookingData);
+
+  return NextResponse.json({
+    success: true,
+    message: `Booking ${bookingId} synchronized.`,
+  });
+}
+
+export async function POST(request: NextRequest) {
+  if (
+    !hasValidSecret(request, "BEDS24_WEBHOOK_SECRET", [
+      "x-beds24-webhook-secret",
+      "x-webhook-secret",
+    ])
+  ) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  try {
+    const rawBody = await request.text();
+    const payload = parseWebhookPayload(
+      rawBody,
+      request.headers.get("content-type"),
+    );
+    const bookingId = extractBookingId(payload);
+
     if (!bookingId) {
-      return NextResponse.json({ error: "Missing booking ID in webhook payload." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing booking ID in webhook payload." },
+        { status: 400 },
+      );
     }
 
     console.log(`[Webhook] Received update for booking: ${bookingId}`);
 
-    // 最新の予約情報をBeds24から再取得する（情報欠損や不正リクエストを防ぐため）
-    const bookingData = await getBookingFromBeds24(bookingId);
-    
-    if (!bookingData) {
-      return NextResponse.json({ error: `Booking ${bookingId} not found in Beds24.` }, { status: 404 });
-    }
+    return syncBookingById(bookingId);
+  } catch (error) {
+    const message = getErrorMessage(error);
 
-    // 取得した予約データをSupabaseへ同期（日割り計算含む）
-    await syncBookingAndRevenue(bookingData);
-
-    return NextResponse.json({ success: true, message: `Booking ${bookingId} synchronized.` });
-  } catch (error: any) {
-    console.error("[Webhook Error]:", error.message);
-    return NextResponse.json({ error: "Internal Server Error", details: error.message }, { status: 500 });
+    console.error("[Webhook Error]:", message);
+    return NextResponse.json(
+      { error: "Internal Server Error", details: message },
+      { status: 500 },
+    );
   }
 }
 
-// GETメソッドも念のためサポート（Beds24がGETパラメーターで飛ばす場合への対応）
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const bookingId = searchParams.get("bookingId") || searchParams.get("id");
+export async function GET(request: NextRequest) {
+  if (
+    !hasValidSecret(request, "BEDS24_WEBHOOK_SECRET", [
+      "x-beds24-webhook-secret",
+      "x-webhook-secret",
+    ])
+  ) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const bookingId =
+    request.nextUrl.searchParams.get("bookingId") ??
+    request.nextUrl.searchParams.get("id");
 
   if (!bookingId) {
     return NextResponse.json({ error: "Missing booking ID." }, { status: 400 });
   }
 
   try {
-    const bookingData = await getBookingFromBeds24(bookingId);
-    if (!bookingData) {
-      return NextResponse.json({ error: "Not found." }, { status: 404 });
-    }
-
-    await syncBookingAndRevenue(bookingData);
-    return NextResponse.json({ success: true, message: "Sync successful from GET." });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return syncBookingById(bookingId);
+  } catch (error) {
+    return NextResponse.json(
+      { error: getErrorMessage(error) },
+      { status: 500 },
+    );
   }
 }
