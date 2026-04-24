@@ -12,13 +12,26 @@ type YearlyData = {
   data: { month: string; amount: number }[];
 };
 
-export function YearlyRevenueTable({ yearlyData }: { yearlyData: YearlyData[] }) {
+export function YearlyRevenueTable({
+  yearlyData,
+  title,
+}: {
+  yearlyData: YearlyData[];
+  title?: string;
+}) {
   if (!yearlyData || yearlyData.length === 0) {
     return null;
   }
 
   return (
-    <div className="rounded-md border border-slate-200 overflow-x-auto bg-white">
+    <div className="space-y-3">
+      {title && (
+        <h3 className="text-md font-bold text-slate-700 flex items-center gap-2">
+          <span className="w-1.5 h-4 bg-blue-500 rounded-full"></span>
+          {title}
+        </h3>
+      )}
+      <div className="rounded-md border border-slate-200 overflow-x-auto bg-white">
       <Table className="min-w-[900px]">
         <TableHeader className="bg-slate-50/80">
           <TableRow>
@@ -56,6 +69,7 @@ export function YearlyRevenueTable({ yearlyData }: { yearlyData: YearlyData[] })
           })}
         </TableBody>
       </Table>
+      </div>
     </div>
   );
 }
